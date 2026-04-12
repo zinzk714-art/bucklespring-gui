@@ -21,7 +21,7 @@ Bucklespring is a command-line tool. This GUI wraps it so you can:
 
 ## Screenshot
 
-![Buckle-GUI Windows 7](img/preview.png)
+![Buckle-GUI Windows 7](img/preview.PNG
 
 ---
 
