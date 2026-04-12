@@ -419,7 +419,8 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_CLOSE:
         save_settings();
-        ShowWindow(wnd, SW_HIDE);
+        stop_buckle(); 
+        DestroyWindow(wnd);
         return 0;
 
     case WM_DESTROY:
