@@ -108,6 +108,11 @@ bucklespring/
 
 ---
 
+This project uses Bucklespring by zevv, licensed under its original license.
+See THIRD_PARTY_LICENSES/ for details.
+
+---
+
 ## Credits
 
 - [Bucklespring](https://github.com/zevv/bucklespring) by zevv — the original tool this GUI wraps
