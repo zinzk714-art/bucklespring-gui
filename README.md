@@ -1,27 +1,37 @@
 # buckle-gui
 
-A Windows GUI launcher for [Bucklespring](https://github.com/zevv/bucklespring) — the nostalgic IBM Model M keyboard sound simulator.
+> A native Win32 GUI launcher for [Bucklespring](https://github.com/zevv/bucklespring) — the IBM Model M keyboard sound simulator.
 
-![Windows 7](https://img.shields.io/badge/Windows-7%2B-blue) ![C](https://img.shields.io/badge/language-C-lightgrey) ![License](https://img.shields.io/badge/license-MIT-green)
+![Windows 7+](https://img.shields.io/badge/Windows-7%2B-0078D4?logo=windows&logoColor=white)
+![Language C](https://img.shields.io/badge/language-C-A8B9CC?logo=c&logoColor=white)
+![License MIT](https://img.shields.io/badge/license-MIT-22c55e)
+![Size](https://img.shields.io/badge/size-%3C1MB-orange)
 
 ---
 
-## What it does
+## Why this exists
 
-Bucklespring is a command-line tool. This GUI wraps it so you can:
-
-- Control gain and stereo width with sliders
-- Browse for the audio folder
-- Toggle options (muted start, no click sounds, fallback sounds)
-- See buckle's output in a real-time log
-- Enable or disable Windows autostart with one click
-- Minimize to the system tray
+Bucklespring is a brilliant tool, but it lives entirely in the terminal. This GUI wraps it with zero overhead — **no Electron, no Python, no runtimes** — just native Win32 C code that weighs less than 1MB and idles at 0% CPU.
 
 ---
 
 ## Screenshot
 
-![Buckle-GUI Windows 7](img/preview.PNG)
+![buckle-gui running on Windows 7](img/preview.PNG)
+
+---
+
+## Features
+
+- **Real-time log** — pipe captures buckle's stdout/stderr directly into the UI
+- **Sliders** for gain and stereo width
+- **System tray** — minimize to tray, right-click menu, double-click to restore
+- **Autostart toggle** — one click writes/removes the Windows Run registry key
+- **Start on launch** — optionally launch buckle automatically when the GUI opens
+- **Audio folder browser** — no manual path typing required
+- **Settings persistence** — all options saved to `buckle-gui.ini` automatically
+- **Input validation** — mute key format checked before launch, paths properly escaped
+- **DPI aware** — sharp on 125%/150% scaling (Windows 7+)
 
 ---
 
@@ -39,9 +49,46 @@ wav/
 
 ---
 
+## Quick start
+
+1. Run `buckle-gui.exe`
+2. Set **Audio Path** to the folder containing the `.wav` files
+3. Click **Start**
+
+That's it. Settings are saved automatically on close.
+
+---
+
+## Options reference
+
+| Option | Description |
+|--------|-------------|
+| Gain | Playback volume (0–100) |
+| Stereo Width | Stereo field width (0 = mono, 100 = full) |
+| Audio Path | Folder containing the `.wav` sound files |
+| Device | OpenAL audio device (blank = system default) |
+| Start muted | Launch buckle in muted state |
+| No mouse click sounds | Disable sounds on mouse button clicks |
+| Fallback sound | Play a generic sound for unrecognized keys |
+| Start buckle when GUI opens | Auto-launch buckle on every GUI start |
+| Mute key | Hex scancode to toggle mute (default `0x46` = Scroll Lock) |
+
+### Mute toggle
+
+Press the mute key **twice within 2 seconds** to toggle mute. Default: Scroll Lock. Configurable in Options.
+
+### System tray
+
+- **Close (X)** → exits the application
+- **Minimize** → sends to taskbar
+- **Right-click tray icon** → Show/Hide, Toggle Mute, Stop Buckle, Exit
+- **Double-click tray icon** → restore window
+
+---
+
 ## Building from source
 
-You need [MSYS2](https://www.msys2.org/) with the MinGW-w64 toolchain.
+Requires [MSYS2](https://www.msys2.org/) with the MinGW-w64 toolchain.
 
 ```bash
 # Install dependencies (first time only)
@@ -56,64 +103,41 @@ gcc -O2 -mwindows -o bin/buckle-gui.exe src/buckle-gui.c src/buckle-gui.res \
     -luser32 -lgdi32 -lshell32 -lcomctl32 -lole32
 ```
 
-No additional libraries required. The GUI depends only on Windows system DLLs.
+No additional libraries required beyond Windows system DLLs.
 
 ---
 
-## Usage
+## Technical notes
 
-1. Run `buckle-gui.exe`
-2. Set the **Audio Path** to the folder containing the `.wav` files
-3. Click **Start**
-
-Settings are saved automatically to `buckle-gui.ini` in the same directory.
-
-### Options
-
-| Option | Description |
-|--------|-------------|
-| Gain | Playback volume (0–100) |
-| Stereo Width | How wide the stereo field is (0 = mono, 100 = full) |
-| Audio Path | Path to the folder with `.wav` sound files |
-| Device | OpenAL audio device (leave blank for system default) |
-| Start muted | Launch buckle in muted state |
-| No mouse click sounds | Disable sounds for mouse button clicks |
-| Fallback sound | Play a generic sound for unrecognized keys |
-| Start buckle when GUI opens | Auto-launch buckle every time the GUI starts |
-| Mute key | Hex scancode to toggle mute (default `0x46` = Scroll Lock) |
-
-### Mute toggle
-
-Press the mute key twice within 2 seconds to toggle mute. The default key is **Scroll Lock**. You can change it in the Options section.
-
-### System tray
-
-Closing the window hides it to the system tray. Right-click the tray icon for options. Double-click to restore.
+- Single `.c` file, ~950 lines, no external dependencies
+- Pipe + dedicated reader thread captures buckle output asynchronously — UI never blocks
+- `PostMessageW` used for thread-safe log updates
+- Shutdown sequence: pipe closed before thread join — guaranteed instant exit
+- Registry path properly escaped via `CommandLineToArgvW`-compliant escaping
+- `buckle-gui.manifest` enables DPI awareness and Common Controls v6
 
 ---
 
 ## Project structure
 
 ```
-bucklespring/
+bucklespring-gui/
 ├── src/
 │   ├── buckle-gui.c        — full source, single file
-│   ├── buckle-gui.rc       — icon, manifest and version info
+│   ├── buckle-gui.rc       — icon, manifest, version info
 │   └── buckle-gui.manifest — DPI aware + Common Controls v6
 ├── bin/
 │   └── buckle-gui.exe      — precompiled binary
+├── img/
+│   └── preview.PNG         — screenshot
 ├── wav/                    — audio files (from original bucklespring)
+├── LICENSE
 └── README.md
 ```
 
 ---
 
-This project uses Bucklespring by zevv, licensed under its original license.
-See THIRD_PARTY_LICENSES/ for details.
-
----
-
 ## Credits
 
-- [Bucklespring](https://github.com/zevv/bucklespring) by zevv — the original tool this GUI wraps
+- [Bucklespring](https://github.com/zevv/bucklespring) by [zevv](https://github.com/zevv) — the original tool this GUI wraps, licensed under its own terms
 - GUI by [zinzk714-art](https://github.com/zinzk714-art)
