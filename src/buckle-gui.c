@@ -157,6 +157,80 @@ static void log_clear(void)
     SetWindowTextW(H_edt_log, L"");
 }
 
+/* ── input validation and escaping ──────────────────────────────────── */
+
+/*
+ * escape_cmdarg — wraps `in` in double-quotes and escapes internal
+ * backslashes and double-quotes following the CommandLineToArgvW contract:
+ *
+ *   - Backslashes immediately preceding a '"' are doubled, then the '"'
+ *     is prefixed with '\'.
+ *   - Backslashes at the very end of the string (before the closing '"')
+ *     are doubled.
+ *   - All other backslashes are emitted as-is.
+ *
+ * `out` receives the result including the surrounding quotes and a NUL
+ * terminator.  Returns FALSE if `outlen` is too small (output unusable).
+ *
+ * Safe output buffer size: (wcslen(in) * 2) + 3  (open-quote + worst-case
+ * escaping + close-quote + NUL).  The EARG_MAX macro below provides this.
+ */
+static BOOL escape_cmdarg(const WCHAR *in, WCHAR *out, int outlen)
+{
+    int wi = 0;
+
+    if (wi >= outlen - 1) return FALSE;
+    out[wi++] = L'"';
+
+    for (int i = 0; in[i]; ) {
+        int bs = 0;
+        while (in[i] == L'\\') { bs++; i++; }
+
+        if (in[i] == L'\0') {
+            for (int j = 0; j < bs * 2; j++) {
+                if (wi >= outlen - 2) return FALSE;
+                out[wi++] = L'\\';
+            }
+            break;
+        } else if (in[i] == L'"') {
+            for (int j = 0; j < bs * 2 + 1; j++) {
+                if (wi >= outlen - 2) return FALSE;
+                out[wi++] = L'\\';
+            }
+            if (wi >= outlen - 2) return FALSE;
+            out[wi++] = L'"';
+            i++;
+        } else {
+            for (int j = 0; j < bs; j++) {
+                if (wi >= outlen - 2) return FALSE;
+                out[wi++] = L'\\';
+            }
+            if (wi >= outlen - 2) return FALSE;
+            out[wi++] = in[i++];
+        }
+    }
+
+    if (wi >= outlen - 1) return FALSE;
+    out[wi++] = L'"';
+    out[wi]   = L'\0';
+    return TRUE;
+}
+
+/*
+ * is_valid_scancode — accepts an empty string (use default) or a
+ * hex literal of the form [0x|0X]<hex-digits>.
+ */
+static BOOL is_valid_scancode(const WCHAR *s)
+{
+    while (*s == L' ') s++;
+    if (*s == L'\0') return TRUE;
+    if (s[0] == L'0' && (s[1] == L'x' || s[1] == L'X')) s += 2;
+    if (*s == L'\0') return FALSE;
+    for (; *s; s++)
+        if (!iswxdigit(*s)) return FALSE;
+    return TRUE;
+}
+
 /* ── pipe reader thread ──────────────────────────────────────────────── */
 static DWORD WINAPI log_reader_thread(LPVOID param)
 {
@@ -227,8 +301,10 @@ static void autostart_set(BOOL enable)
     }
 
     if (enable) {
-        WCHAR exe[MAX_PATH];
-        _snwprintf(exe, MAX_PATH, L"\"%s%s\"", g_dir, L"buckle-gui.exe");
+        WCHAR raw[MAX_PATH];
+        WCHAR exe[MAX_PATH * 2 + 3];
+        _snwprintf(raw, MAX_PATH, L"%s%s", g_dir, L"buckle-gui.exe");
+        escape_cmdarg(raw, exe, MAX_PATH * 2 + 3);
         LSTATUS r = RegSetValueExW(hk, RUN_VALUE, 0, REG_SZ,
                                     (const BYTE *)exe,
                                     (DWORD)((wcslen(exe) + 1) * sizeof(WCHAR)));
@@ -411,6 +487,15 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
                 CloseHandle(g_pi.hThread);
                 ZeroMemory(&g_pi, sizeof(g_pi));
                 g_running = FALSE;
+                if (g_hReadPipe) {
+                    CloseHandle(g_hReadPipe);
+                    g_hReadPipe = NULL;
+                }
+                if (g_hLogThread) {
+                    WaitForSingleObject(g_hLogThread, 2000);
+                    CloseHandle(g_hLogThread);
+                    g_hLogThread = NULL;
+                }
                 update_status();
                 log_append(L"[gui] buckle process exited.\r\n");
             }
@@ -418,15 +503,23 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_CLOSE:
+        KillTimer(wnd, ID_TIMER_POLL);
         save_settings();
-        stop_buckle(); 
+        stop_buckle();
         DestroyWindow(wnd);
         return 0;
 
     case WM_DESTROY:
-        KillTimer(wnd, ID_TIMER_POLL);
         stop_buckle();
         remove_tray();
+        {
+            MSG drain;
+            while (PeekMessageW(&drain, wnd,
+                                WM_LOG_APPEND, WM_LOG_APPEND, PM_REMOVE)) {
+                WCHAR *p = (WCHAR *)drain.lParam;
+                if (p) HeapFree(GetProcessHeap(), 0, p);
+            }
+        }
         if (g_hMutex) {
             CloseHandle(g_hMutex);
             g_hMutex = NULL;
@@ -528,12 +621,26 @@ static void create_controls(HWND wnd)
 }
 
 /* ── process management ──────────────────────────────────────────────── */
-static void build_cmdline(WCHAR *out, int outlen)
+
+/*
+ * EARG_MAX — safe output buffer size for escape_cmdarg given an input
+ * buffer of N wchar_t elements: every character could be a backslash
+ * before a quote (2 chars out per 1 in), plus open-quote + close-quote
+ * + NUL = N*2 + 3.
+ */
+#define EARG_MAX(n) ((n) * 2 + 3)
+
+static BOOL build_cmdline(WCHAR *out, int outlen)
 {
     WCHAR path[MAX_PATH] = {0};
     WCHAR dev[256]       = {0};
     WCHAR key[32]        = {0};
     WCHAR exe[MAX_PATH]  = {0};
+
+    WCHAR eexe [EARG_MAX(MAX_PATH)];
+    WCHAR epath[EARG_MAX(MAX_PATH)];
+    WCHAR edev [EARG_MAX(256)];
+    WCHAR tmp  [2048];
 
     GetWindowTextW(H_edt_path,    path, MAX_PATH);
     GetWindowTextW(H_edt_device,  dev,  256);
@@ -542,7 +649,13 @@ static void build_cmdline(WCHAR *out, int outlen)
     WCHAR *kp = key;
     while (*kp == L' ') kp++;
 
-    _snwprintf(exe, MAX_PATH, L"%sbuckle.exe", g_dir);
+    int r;
+
+    r = _snwprintf(exe, MAX_PATH, L"%sbuckle.exe", g_dir);
+    if (r < 0 || r >= MAX_PATH) { out[0] = L'\0'; return FALSE; }
+
+    if (!escape_cmdarg(exe,  eexe,  EARG_MAX(MAX_PATH))) { out[0] = L'\0'; return FALSE; }
+    if (!escape_cmdarg(path, epath, EARG_MAX(MAX_PATH))) { out[0] = L'\0'; return FALSE; }
 
     int  gain   = (int)SendMessageW(H_sld_gain,    TBM_GETPOS, 0, 0);
     int  stereo = (int)SendMessageW(H_sld_stereo,  TBM_GETPOS, 0, 0);
@@ -550,38 +663,47 @@ static void build_cmdline(WCHAR *out, int outlen)
     BOOL bnoc   = SendMessageW(H_chk_noclick,  BM_GETCHECK, 0, 0) == BST_CHECKED;
     BOOL bfbk   = SendMessageW(H_chk_fallback, BM_GETCHECK, 0, 0) == BST_CHECKED;
 
-    _snwprintf(out, outlen,
-        L"\"%ls\" -g %d -s %d -p \"%ls\"%ls%ls%ls",
-        exe, gain, stereo, path,
+    r = _snwprintf(out, outlen,
+        L"%ls -g %d -s %d -p %ls%ls%ls%ls",
+        eexe, gain, stereo, epath,
         bmut ? L" -M" : L"",
         bnoc ? L" -c" : L"",
         bfbk ? L" -f" : L"");
-
-    WCHAR tmp[2048];
+    if (r < 0 || r >= outlen) { out[0] = L'\0'; return FALSE; }
 
     if (dev[0]) {
-        _snwprintf(tmp, 2048, L"%ls -d \"%ls\"", out, dev);
-        _snwprintf(out, outlen, L"%ls", tmp);
+        if (!escape_cmdarg(dev, edev, EARG_MAX(256))) { out[0] = L'\0'; return FALSE; }
+        r = _snwprintf(tmp, 2048, L"%ls -d %ls", out, edev);
+        if (r < 0 || r >= 2048) { out[0] = L'\0'; return FALSE; }
+        r = _snwprintf(out, outlen, L"%ls", tmp);
+        if (r < 0 || r >= outlen) { out[0] = L'\0'; return FALSE; }
     }
 
     if (kp[0] && wcscmp(kp, L"0x46") != 0) {
-        _snwprintf(tmp, 2048, L"%ls -m %ls", out, kp);
-        _snwprintf(out, outlen, L"%ls", tmp);
+        r = _snwprintf(tmp, 2048, L"%ls -m %ls", out, kp);
+        if (r < 0 || r >= 2048) { out[0] = L'\0'; return FALSE; }
+        r = _snwprintf(out, outlen, L"%ls", tmp);
+        if (r < 0 || r >= outlen) { out[0] = L'\0'; return FALSE; }
     }
+
+    return TRUE;
 }
+
+#undef EARG_MAX
 
 static void start_buckle(void)
 {
     if (g_running) return;
 
-    WCHAR exe[MAX_PATH];
-    _snwprintf(exe, MAX_PATH, L"%sbuckle.exe", g_dir);
-    if (GetFileAttributesW(exe) == INVALID_FILE_ATTRIBUTES) {
-        WCHAR errmsg[MAX_PATH + 64];
-        _snwprintf(errmsg, MAX_PATH + 64,
-            L"[gui] ERROR: buckle.exe not found at:\r\n[gui]   %ls\r\n", exe);
-        log_append(errmsg);
-        return;
+    WCHAR key[32] = {0};
+    GetWindowTextW(H_edt_mutekey, key, 32);
+    {
+        WCHAR *kp = key;
+        while (*kp == L' ') kp++;
+        if (!is_valid_scancode(kp)) {
+            log_append(L"[gui] ERROR: Mute key must be a hex value (e.g. 0x46).\r\n");
+            return;
+        }
     }
 
     SECURITY_ATTRIBUTES sa = {0};
@@ -592,14 +714,28 @@ static void start_buckle(void)
         log_append(L"[gui] ERROR: failed to create pipe.\r\n");
         return;
     }
-    SetHandleInformation(g_hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    if (!SetHandleInformation(g_hReadPipe, HANDLE_FLAG_INHERIT, 0)) {
+        log_append(L"[gui] ERROR: SetHandleInformation failed.\r\n");
+        CloseHandle(g_hReadPipe);  g_hReadPipe  = NULL;
+        CloseHandle(g_hWritePipe); g_hWritePipe = NULL;
+        return;
+    }
 
     WCHAR cmd[2048] = {0};
-    build_cmdline(cmd, 2048);
+    if (!build_cmdline(cmd, 2048)) {
+        log_append(L"[gui] ERROR: command line too long.\r\n");
+        CloseHandle(g_hReadPipe);  g_hReadPipe  = NULL;
+        CloseHandle(g_hWritePipe); g_hWritePipe = NULL;
+        return;
+    }
 
     WCHAR logline[2200];
-    _snwprintf(logline, 2200, L"[gui] Launching: %ls\r\n", cmd);
-    log_append(logline);
+    int lr = _snwprintf(logline, 2200, L"[gui] Launching: %ls\r\n", cmd);
+    if (lr < 0 || lr >= 2200)
+        log_append(L"[gui] Launching buckle (command line too long to display).\r\n");
+    else
+        log_append(logline);
 
     STARTUPINFOW si = {0};
     si.cb         = sizeof(si);
@@ -640,6 +776,7 @@ static void stop_buckle(void)
     CloseHandle(g_pi.hThread);
     ZeroMemory(&g_pi, sizeof(g_pi));
 
+    /* close read end first — unblocks ReadFile in log_reader_thread */
     if (g_hReadPipe) {
         CloseHandle(g_hReadPipe);
         g_hReadPipe = NULL;
