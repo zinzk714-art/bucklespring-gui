@@ -126,8 +126,6 @@ bucklespring-gui/
 │   ├── buckle-gui.c        — full source, single file
 │   ├── buckle-gui.rc       — icon, manifest, version info
 │   └── buckle-gui.manifest — DPI aware + Common Controls v6
-├── bin/
-│   └── buckle-gui.exe      — precompiled binary
 ├── img/
 │   └── preview.PNG         — screenshot
 ├── wav/                    — audio files (from original bucklespring)
