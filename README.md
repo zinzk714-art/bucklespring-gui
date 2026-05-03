@@ -109,7 +109,7 @@ No additional libraries required beyond Windows system DLLs.
 
 ## Technical notes
 
-- Single `.c` file, ~950 lines, no external dependencies
+- Single `.c` file, ~1009 lines, no external dependencies
 - Pipe + dedicated reader thread captures buckle output asynchronously — UI never blocks
 - `PostMessageW` used for thread-safe log updates
 - Shutdown sequence: pipe closed before thread join — guaranteed instant exit
