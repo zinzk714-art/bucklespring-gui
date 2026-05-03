@@ -23,7 +23,8 @@
 #include <objbase.h>
 
 #define IDI_MYICON    1
-#define WM_LOG_APPEND (WM_APP + 1)
+#define WM_LOG_APPEND  (WM_APP + 1)
+#define WM_PROC_EXITED (WM_APP + 2)
 
 #include <stdio.h>
 
@@ -73,6 +74,7 @@ static WCHAR               g_ini[MAX_PATH];
 static HANDLE              g_hReadPipe  = NULL;
 static HANDLE              g_hWritePipe = NULL;
 static HANDLE              g_hLogThread = NULL;
+static HANDLE              g_hProcWait  = NULL;
 
 static HWND H_sld_gain,    H_val_gain;
 static HWND H_sld_stereo,  H_val_stereo;
@@ -139,7 +141,24 @@ static void log_trim_if_needed(void)
 {
     int len = GetWindowTextLengthW(H_edt_log);
     if (len < LOG_MAX_CHARS) return;
-    SendMessageW(H_edt_log, EM_SETSEL, 0, LOG_TRIM_CHARS);
+
+    /*
+     * Read LOG_TRIM_CHARS + 64 chars to find the next \n boundary,
+     * so the cut never lands in the middle of a \r\n pair.
+     */
+    int  buflen = LOG_TRIM_CHARS + 65;
+    WCHAR *scan = (WCHAR *)HeapAlloc(GetProcessHeap(), 0,
+                                      buflen * sizeof(WCHAR));
+    int cut = LOG_TRIM_CHARS;
+    if (scan) {
+        int got = GetWindowTextW(H_edt_log, scan, buflen);
+        for (int i = LOG_TRIM_CHARS; i < got; i++) {
+            if (scan[i] == L'\n') { cut = i + 1; break; }
+        }
+        HeapFree(GetProcessHeap(), 0, scan);
+    }
+
+    SendMessageW(H_edt_log, EM_SETSEL, 0, cut);
     SendMessageW(H_edt_log, EM_REPLACESEL, FALSE, (LPARAM)L"");
 }
 
@@ -263,6 +282,23 @@ static DWORD WINAPI log_reader_thread(LPVOID param)
 
         HeapFree(GetProcessHeap(), 0, wbuf);
 
+        /* prepend [HH:MM:SS] timestamp */
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        WCHAR tsbuf[16];
+        _snwprintf(tsbuf, 16, L"[%02d:%02d:%02d] ",
+                   st.wHour, st.wMinute, st.wSecond);
+        int tslen  = (int)wcslen(tsbuf);
+        int rblen  = (int)wcslen(rbuf);
+        WCHAR *tsbuf2 = (WCHAR *)HeapAlloc(GetProcessHeap(), 0,
+                            (tslen + rblen + 1) * sizeof(WCHAR));
+        if (tsbuf2) {
+            wcscpy(tsbuf2, tsbuf);
+            wcscat(tsbuf2, rbuf);
+            HeapFree(GetProcessHeap(), 0, rbuf);
+            rbuf = tsbuf2;
+        }
+
         /*
          * PostMessageW returns 0 if the window is gone (destroyed or
          * queue full). In that case WM_LOG_APPEND will never run, so
@@ -338,6 +374,7 @@ static void toggle_autostart(void)
 }
 
 /* ── forward declarations ────────────────────────────────────────────── */
+static VOID CALLBACK on_process_exited(PVOID param, BOOLEAN fired);
 static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 static void create_controls(HWND);
 static void start_buckle(void);
@@ -351,6 +388,17 @@ static void update_slider_label(HWND slider, HWND label);
 static void save_settings(void);
 static void load_settings(void);
 static void send_mute_sequence(void);
+
+/* ── process exit callback (called from thread pool) ────────────────── */
+static VOID CALLBACK on_process_exited(PVOID param, BOOLEAN fired)
+{
+    (void)param; (void)fired;
+    if (g_hProcWait) {
+        UnregisterWait(g_hProcWait);
+        g_hProcWait = NULL;
+    }
+    PostMessageW(g_wnd, WM_PROC_EXITED, 0, 0);
+}
 
 /* ── WinMain ──────────────────────────────────────────────────────────── */
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
@@ -445,6 +493,7 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         HWND ctl = (HWND)lp;
         if (ctl == H_sld_gain)   update_slider_label(H_sld_gain,   H_val_gain);
         if (ctl == H_sld_stereo) update_slider_label(H_sld_stereo, H_val_stereo);
+        save_settings();
         return 0;
     }
 
@@ -455,6 +504,10 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         case ID_BTN_BROWSE:    browse_path();      break;
         case ID_BTN_CLEARLOG:  log_clear();        break;
         case ID_BTN_AUTOSTART: toggle_autostart(); break;
+        case ID_CHK_MUTED:
+        case ID_CHK_NOCLICK:
+        case ID_CHK_FALLBACK:
+        case ID_CHK_AUTOLAUNCH: save_settings();   break;
         case IDM_SHOW:
             ShowWindow(wnd, SW_RESTORE);
             SetForegroundWindow(wnd);
@@ -479,27 +532,27 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_TIMER:
-        if (wp == ID_TIMER_POLL && g_running && g_pi.hProcess) {
-            DWORD code = STILL_ACTIVE;
-            GetExitCodeProcess(g_pi.hProcess, &code);
-            if (code != STILL_ACTIVE) {
-                CloseHandle(g_pi.hProcess);
-                CloseHandle(g_pi.hThread);
-                ZeroMemory(&g_pi, sizeof(g_pi));
-                g_running = FALSE;
-                if (g_hReadPipe) {
-                    CloseHandle(g_hReadPipe);
-                    g_hReadPipe = NULL;
-                }
-                if (g_hLogThread) {
-                    WaitForSingleObject(g_hLogThread, 2000);
-                    CloseHandle(g_hLogThread);
-                    g_hLogThread = NULL;
-                }
-                update_status();
-                log_append(L"[gui] buckle process exited.\r\n");
-            }
+        /* timer kept only to refresh tray tooltip periodically */
+        return 0;
+
+    case WM_PROC_EXITED:
+        if (g_pi.hProcess) {
+            CloseHandle(g_pi.hProcess);
+            CloseHandle(g_pi.hThread);
+            ZeroMemory(&g_pi, sizeof(g_pi));
         }
+        g_running = FALSE;
+        if (g_hReadPipe) {
+            CloseHandle(g_hReadPipe);
+            g_hReadPipe = NULL;
+        }
+        if (g_hLogThread) {
+            WaitForSingleObject(g_hLogThread, 2000);
+            CloseHandle(g_hLogThread);
+            g_hLogThread = NULL;
+        }
+        update_status();
+        log_append(L"[gui] buckle process exited.\r\n");
         return 0;
 
     case WM_CLOSE:
@@ -640,7 +693,7 @@ static BOOL build_cmdline(WCHAR *out, int outlen)
     WCHAR eexe [EARG_MAX(MAX_PATH)];
     WCHAR epath[EARG_MAX(MAX_PATH)];
     WCHAR edev [EARG_MAX(256)];
-    WCHAR tmp  [2048];
+    WCHAR tmp  [4096];
 
     GetWindowTextW(H_edt_path,    path, MAX_PATH);
     GetWindowTextW(H_edt_device,  dev,  256);
@@ -673,15 +726,15 @@ static BOOL build_cmdline(WCHAR *out, int outlen)
 
     if (dev[0]) {
         if (!escape_cmdarg(dev, edev, EARG_MAX(256))) { out[0] = L'\0'; return FALSE; }
-        r = _snwprintf(tmp, 2048, L"%ls -d %ls", out, edev);
-        if (r < 0 || r >= 2048) { out[0] = L'\0'; return FALSE; }
+        r = _snwprintf(tmp, 4096, L"%ls -d %ls", out, edev);
+        if (r < 0 || r >= 4096) { out[0] = L'\0'; return FALSE; }
         r = _snwprintf(out, outlen, L"%ls", tmp);
         if (r < 0 || r >= outlen) { out[0] = L'\0'; return FALSE; }
     }
 
     if (kp[0] && wcscmp(kp, L"0x46") != 0) {
-        r = _snwprintf(tmp, 2048, L"%ls -m %ls", out, kp);
-        if (r < 0 || r >= 2048) { out[0] = L'\0'; return FALSE; }
+        r = _snwprintf(tmp, 4096, L"%ls -m %ls", out, kp);
+        if (r < 0 || r >= 4096) { out[0] = L'\0'; return FALSE; }
         r = _snwprintf(out, outlen, L"%ls", tmp);
         if (r < 0 || r >= outlen) { out[0] = L'\0'; return FALSE; }
     }
@@ -721,18 +774,20 @@ static void start_buckle(void)
         CloseHandle(g_hWritePipe); g_hWritePipe = NULL;
         return;
     }
+    /* write end must NOT be inherited by buckle's children */
+    SetHandleInformation(g_hWritePipe, HANDLE_FLAG_INHERIT, 0);
 
-    WCHAR cmd[2048] = {0};
-    if (!build_cmdline(cmd, 2048)) {
-        log_append(L"[gui] ERROR: command line too long.\r\n");
+    WCHAR cmd[4096] = {0};
+    if (!build_cmdline(cmd, 4096)) {
+        log_append(L"[gui] ERROR: command line too long — shorten the audio path or device name.\r\n");
         CloseHandle(g_hReadPipe);  g_hReadPipe  = NULL;
         CloseHandle(g_hWritePipe); g_hWritePipe = NULL;
         return;
     }
 
-    WCHAR logline[2200];
-    int lr = _snwprintf(logline, 2200, L"[gui] Launching: %ls\r\n", cmd);
-    if (lr < 0 || lr >= 2200)
+    WCHAR logline[4200];
+    int lr = _snwprintf(logline, 4200, L"[gui] Launching: %ls\r\n", cmd);
+    if (lr < 0 || lr >= 4200)
         log_append(L"[gui] Launching buckle (command line too long to display).\r\n");
     else
         log_append(logline);
@@ -761,6 +816,10 @@ static void start_buckle(void)
 
     g_hLogThread = CreateThread(NULL, 0, log_reader_thread, NULL, 0, NULL);
 
+    RegisterWaitForSingleObject(&g_hProcWait, g_pi.hProcess,
+        on_process_exited, NULL, INFINITE,
+        WT_EXECUTEONLYONCE | WT_EXECUTEINWAITTHREAD);
+
     g_running = TRUE;
     update_status();
 }
@@ -768,6 +827,11 @@ static void start_buckle(void)
 static void stop_buckle(void)
 {
     if (!g_running || !g_pi.hProcess) return;
+
+    if (g_hProcWait) {
+        UnregisterWait(g_hProcWait);
+        g_hProcWait = NULL;
+    }
 
     /* buckle has no open files or transactions — terminate is safe here */
     TerminateProcess(g_pi.hProcess, 0);
